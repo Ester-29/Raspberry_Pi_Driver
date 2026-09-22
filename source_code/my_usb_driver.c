@@ -1,7 +1,7 @@
 #include <linux/module.h>
 #include <linux/usb.h>
 #define VENDOR_ID 0x14cd
-#define PRODUCT_ID 0x8125
+#define PRODUCT_ID 0x1212
 static const struct usb_device_id my_usb_table [] ={
 { USB_DEVICE (VENDOR_ID, PRODUCT_ID) },
 {}
