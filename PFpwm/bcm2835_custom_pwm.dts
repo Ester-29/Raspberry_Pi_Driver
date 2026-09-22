@@ -1,0 +1,20 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target-path = "/soc";
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            custom_pwm_node: pwm@2020c000 {
+                compatible = "bcm2835,custom-pwm";
+                reg = <0x2020c000 0x28>;
+                status = "okay";
+            };
+        };
+    };
+};
