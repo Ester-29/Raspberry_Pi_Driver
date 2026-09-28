@@ -1,0 +1,970 @@
+Trước hết, một chỉnh nhỏ: RTC ở đây là Real-Time Clock (đồng hồ thời gian thực, giữ ngày giờ), không phải "real-time control". Có một điểm quyết định toàn bộ cách làm: Pi Zero W không có chip RTC. Trong các dòng Pi phổ biến, chỉ Pi 5 có RTC tích hợp. Giờ trên Pi Zero W đến từ NTP qua Wi-Fi và fake-hwclock (lưu giờ vào file lúc tắt máy). Vì vậy driver phải được thiết kế để vẫn chạm vào phần cứng thật của SoC.
+
+Tình trạng kiểm chứng:
+
+Đã làm: biên dịch sạch, 0 warning với W=1, trên header 7.0.0-30-generic (đúng kernel VM của bạn) và trên 6.8. Cross-compile ARMv6 cho Pi Zero W (kernel Raspberry Pi 6.18) thành công và không dính hàm chia 64-bit __aeabi_uldivmod. Overlay áp thành công lên DTB gốc bcm2708-rpi-zero-w.dtb, địa chỉ bus 0x7e003000 dịch đúng thành 0x20003000.
+Chưa làm: chạy thật trên VM hoặc Pi. Nếu gặp lỗi, bạn gửi mình kết quả sudo dmesg | tail -30.
+File: lần này mình không đính kèm được, nên dán đủ 6 file ở mục 1.
+0. Ý tưởng: một driver, hai chế độ
+hwclock / timedatectl / rtc_test / cat sysfs            (user-space)
+          │ ioctl(RTC_RD_TIME/RTC_SET_TIME), đọc sysfs
+          ▼
+/dev/rtcN + /sys/class/rtc/rtcN     ← RTC core của kernel tạo sẵn (char device chuẩn)
+          │ gọi rtc_class_ops
+          ▼
+soft_rtc_read_time() / soft_rtc_set_time()               ← code của bạn
+          ├─ Pi (HW mode): readl(0x20003000 + CLO/CHI) → System Timer 64-bit, 1 MHz trong SoC
+          └─ VM (SW mode): ktime_get_boottime_ns()     → đồng hồ phần mềm của kernel
+Ghép device ↔ driver:  Pi = Device Tree (compatible)  |  VM = soft_rtc_dev.ko (khớp theo tên)
+
+Trên Pi, driver đọc bộ đếm của System Timer, cũng chính là khối "Timer" trong hình của bạn, rồi đổi số tick thành ngày giờ. Driver chỉ đọc hai thanh ghi CLO/CHI và không ghi gì, vì kernel và GPU đang dùng các thanh ghi so sánh C0–C3. VM x86 không có Device Tree và không có SoC này, nên driver tự chuyển sang dùng đồng hồ phần mềm.
+
+File	Vai trò	Dùng ở
+soft_rtc.c	Platform driver RTC	VM + Pi
+soft_rtc_dev.c	Tạo platform_device thay cho Device Tree	Chỉ VM
+soft-rtc-overlay.dts	Device Tree overlay	Pi
+Makefile	Build module, overlay, chương trình test	VM + Pi
+rtc_test.c	Test ioctl có PASS/FAIL	VM + Pi
+run_test.sh	Runtest tự động một lệnh	VM + Pi
+1. Mã nguồn (tạo thư mục ~/soft_rtc, đặt đúng tên file)
+
+Comment viết không dấu để tránh lỗi mã hóa khi copy qua lại giữa Windows và Linux.
+
+soft_rtc.c
+
+c
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * soft_rtc.c - Platform driver RTC minh hoa
+ *
+ * Mot driver, hai che do (tu chon trong probe()):
+ *  - HW mode: device duoc tao tu Device Tree va co thuoc tinh "reg"
+ *    (Raspberry Pi Zero W). Driver doc bo dem 64 bit cua System Timer
+ *    trong SoC BCM2835 (1 MHz) qua MMIO va dung no lam nhip dem giay.
+ *  - SW mode: device khong co "reg" (Ubuntu x86 trong VirtualBox, khong co
+ *    Device Tree, device do soft_rtc_dev.ko tao). Nhip dem = ktime cua kernel.
+ *
+ * Luu y: day KHONG phai RTC co pin nuoi. Mat dien / reboot la mat gio.
+ * User-space giao tiep qua /dev/rtcN do RTC core tao san (hwclock,
+ * timedatectl, /sys/class/rtc/rtcN/...). Driver chi can cai rtc_class_ops,
+ * khong phai tu viet file_operations nhu character device.
+ */
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/mod_devicetable.h>	/* struct of_device_id */
+#include <linux/property.h>		/* device_property_read_u32() */
+#include <linux/rtc.h>			/* RTC core API */
+#include <linux/io.h>			/* devm_ioremap(), readl() */
+#include <linux/delay.h>		/* udelay() */
+#include <linux/ktime.h>		/* ktime_get_*() */
+#include <linux/math64.h>		/* div_u64() */
+#include <linux/version.h>		/* LINUX_VERSION_CODE */
+
+/* Thanh ghi System Timer (BCM2835 ARM Peripherals, chuong 12) */
+#define ST_CLO	0x04	/* 32 bit thap cua bo dem tu do */
+#define ST_CHI	0x08	/* 32 bit cao cua bo dem tu do */
+
+/* Tham so module: bat log moi lan read_time() de chung minh lenh di qua driver */
+static bool trace;
+module_param(trace, bool, 0644);
+MODULE_PARM_DESC(trace, "Log every read_time() call (rate-limited)");
+
+/* Du lieu rieng cua MOT device (probe chay bao nhieu lan thi co bay nhieu ban) */
+struct soft_rtc {
+	struct rtc_device *rtc;
+	void __iomem *base;	/* != NULL: HW mode, NULL: SW mode */
+	u32 tick_hz;		/* so tick moi giay cua nguon dem */
+	u64 base_ticks;		/* gia tri nguon dem tai lan dat gio gan nhat */
+	time64_t base_sec;	/* gio RTC (giay tu 1970, UTC) tai base_ticks */
+};
+
+/* Doc nguon dem: HW = bo dem 64 bit cua SoC, SW = so ns tu luc boot */
+static u64 soft_rtc_ticks(struct soft_rtc *priv)
+{
+	u32 hi, lo;
+
+	if (!priv->base)
+		return ktime_get_boottime_ns();
+
+	/*
+	 * Doc CHI -> CLO -> CHI. Neu CLO vua tran (moi ~71,6 phut) giua hai lan
+	 * doc thi CHI doi gia tri -> doc lai, tranh ghep sai hai nua 32 bit.
+	 */
+	do {
+		hi = readl(priv->base + ST_CHI);
+		lo = readl(priv->base + ST_CLO);
+	} while (hi != readl(priv->base + ST_CHI));
+
+	return ((u64)hi << 32) | lo;
+}
+
+/* Duoc RTC core goi khi user doc gio: ioctl(RTC_RD_TIME), hwclock -r, sysfs... */
+static int soft_rtc_read_time(struct device *dev, struct rtc_time *tm)
+{
+	struct soft_rtc *priv = dev_get_drvdata(dev);
+	/* div_u64: chia 64 bit an toan tren ARM 32 bit ('/' se loi __aeabi_uldivmod) */
+	u64 elapsed = div_u64(soft_rtc_ticks(priv) - priv->base_ticks,
+			      priv->tick_hz);
+
+	rtc_time64_to_tm(priv->base_sec + (time64_t)elapsed, tm);
+	if (trace)
+		dev_info_ratelimited(dev, "read_time -> %ptR UTC\n", tm);
+	return 0;
+}
+
+/* Duoc RTC core goi khi user dat gio: ioctl(RTC_SET_TIME), hwclock --set / -w */
+static int soft_rtc_set_time(struct device *dev, struct rtc_time *tm)
+{
+	struct soft_rtc *priv = dev_get_drvdata(dev);
+
+	/* Khong can mutex rieng: RTC core da giu rtc->ops_lock khi goi ops */
+	priv->base_ticks = soft_rtc_ticks(priv);
+	priv->base_sec = rtc_tm_to_time64(tm);
+	dev_info(dev, "set_time <- %ptR UTC\n", tm);
+	return 0;
+}
+
+/* Cac ham driver cung cap cho RTC core. Khong co .set_alarm -> core tu tat alarm */
+static const struct rtc_class_ops soft_rtc_ops = {
+	.read_time = soft_rtc_read_time,
+	.set_time  = soft_rtc_set_time,
+};
+
+/* probe(): platform bus goi khi tim thay device khop voi driver nay */
+static int soft_rtc_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct soft_rtc *priv;
+	struct resource *res;
+	int ret;
+
+	dev_info(dev, "probe(): matched by %s\n",
+		 dev->of_node ? "Device Tree (compatible)" : "name (no Device Tree)");
+
+	/* devm_*: tai nguyen gan voi vong doi device, tu giai phong khi go device */
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	/* Vung thanh ghi lay tu thuoc tinh "reg" cua node Device Tree */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (res) {
+		u64 t0;
+
+		/*
+		 * Vung System Timer dang duoc clocksource cua kernel dung chung,
+		 * nen chi ioremap (khong request_mem_region) va CHI DOC CLO/CHI.
+		 * Khong bao gio ghi CS/C0..C3 (GPU dung C0/C2, kernel dung C3).
+		 */
+		priv->base = devm_ioremap(dev, res->start, resource_size(res));
+		if (!priv->base)
+			return -ENOMEM;
+
+		/* Tan so bo dem lay tu DT; thieu thi mac dinh 1 MHz */
+		if (device_property_read_u32(dev, "clock-frequency", &priv->tick_hz) ||
+		    !priv->tick_hz) {
+			dev_warn(dev, "no clock-frequency in DT, assuming 1 MHz\n");
+			priv->tick_hz = 1000000;
+		}
+
+		/* Tu kiem tra phan cung: bo dem phai chay, neu khong la "reg" sai */
+		t0 = soft_rtc_ticks(priv);
+		udelay(20);
+		if (soft_rtc_ticks(priv) == t0) {
+			dev_err(dev, "counter at %pR is not running - wrong 'reg'?\n", res);
+			return -ENODEV;
+		}
+		dev_info(dev, "HW mode: counter @ %pR, %u Hz\n", res, priv->tick_hz);
+	} else {
+		priv->tick_hz = NSEC_PER_SEC;
+		dev_info(dev, "SW mode: no 'reg' resource, time base = ktime\n");
+	}
+
+	/*
+	 * Gio ban dau = gio he thong. Tren Pi, driver thanh rtc0 va kernel co the
+	 * dat gio he thong theo rtc0 ngay luc dang ky (hctosys) -> khong bi nhay gio.
+	 */
+	priv->base_ticks = soft_rtc_ticks(priv);
+	priv->base_sec = ktime_get_real_seconds();
+
+	/* Phai set drvdata TRUOC khi dang ky: core co the goi read_time ngay luc do */
+	platform_set_drvdata(pdev, priv);
+
+	priv->rtc = devm_rtc_allocate_device(dev);
+	if (IS_ERR(priv->rtc))
+		return PTR_ERR(priv->rtc);
+
+	priv->rtc->ops = &soft_rtc_ops;
+	priv->rtc->range_min = RTC_TIMESTAMP_BEGIN_2000;	/* 2000-01-01 00:00:00 */
+	priv->rtc->range_max = RTC_TIMESTAMP_END_2099;		/* 2099-12-31 23:59:59 */
+
+	/* Dang ky voi RTC core -> sinh /dev/rtcN va /sys/class/rtc/rtcN */
+	ret = devm_rtc_register_device(priv->rtc);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "probe() done -> /dev/%s\n", dev_name(&priv->rtc->dev));
+	return 0;
+}
+
+/*
+ * remove(): goi khi rmmod driver, khi device bi go (rmmod soft_rtc_dev,
+ * dtoverlay -r) hoac khi unbind. Moi tai nguyen deu la devm_* nen sau khi
+ * ham nay tra ve, kernel tu huy /dev/rtcN, iounmap, kfree theo thu tu nguoc.
+ * Tu kernel 6.11, remove() tra ve void; kernel cu hon tra ve int.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static void soft_rtc_remove(struct platform_device *pdev)
+{
+	dev_info(&pdev->dev, "remove() called\n");
+}
+#else
+static int soft_rtc_remove(struct platform_device *pdev)
+{
+	dev_info(&pdev->dev, "remove() called\n");
+	return 0;
+}
+#endif
+
+/* Bang so khop voi Device Tree: chuoi phai GIONG HET thuoc tinh compatible */
+static const struct of_device_id soft_rtc_of_match[] = {
+	{ .compatible = "demo,soft-rtc" },
+	{ /* sentinel: phan tu rong danh dau het bang */ }
+};
+MODULE_DEVICE_TABLE(of, soft_rtc_of_match);	/* sinh alias de udev tu nap module */
+
+static struct platform_driver soft_rtc_driver = {
+	.probe  = soft_rtc_probe,
+	.remove = soft_rtc_remove,
+	.driver = {
+		.name           = "soft-rtc",	/* dung de match theo ten khi khong co DT */
+		.of_match_table = soft_rtc_of_match,
+	},
+};
+
+/* Macro sinh module_init/module_exit goi platform_driver_register/unregister */
+module_platform_driver(soft_rtc_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("Demo RTC platform driver (BCM2835 system timer / ktime)");
+
+soft_rtc_dev.c (chỉ dùng trên VM)
+
+c
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * soft_rtc_dev.c - CHI dung tren may ao x86 (khong co Device Tree).
+ *
+ * Tao mot platform_device ten "soft-rtc". No dong vai tro ma node Device Tree
+ * dam nhan tren Raspberry Pi: platform bus thay ten device trung voi
+ * driver.name cua soft_rtc.ko -> goi probe() cua driver.
+ */
+#include <linux/module.h>
+#include <linux/platform_device.h>
+
+static struct platform_device *pdev;
+
+static int __init soft_rtc_dev_init(void)
+{
+	/*
+	 * PLATFORM_DEVID_NONE (-1): ten device la "soft-rtc", khong co hau to ".0".
+	 * Khong truyen resource nao -> driver khong thay "reg" -> chay SW mode.
+	 */
+	pdev = platform_device_register_simple("soft-rtc", PLATFORM_DEVID_NONE,
+					       NULL, 0);
+	if (IS_ERR(pdev))
+		return PTR_ERR(pdev);
+
+	pr_info("soft_rtc_dev: platform_device '%s' registered\n",
+		dev_name(&pdev->dev));
+	return 0;
+}
+
+static void __exit soft_rtc_dev_exit(void)
+{
+	/* Go device -> neu driver dang gan vao, remove() cua driver duoc goi */
+	platform_device_unregister(pdev);
+	pr_info("soft_rtc_dev: platform_device removed\n");
+}
+
+module_init(soft_rtc_dev_init);
+module_exit(soft_rtc_dev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Creates a 'soft-rtc' platform_device (stand-in for Device Tree on x86)");
+
+soft-rtc-overlay.dts
+
+dts
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * soft-rtc-overlay.dts - Device Tree overlay cho Raspberry Pi Zero W (BCM2835)
+ *
+ * Them node "rtc@7e003000" vao bus /soc. Kernel tao platform_device
+ * "20003000.rtc", platform bus so "compatible" voi of_match_table cua
+ * soft_rtc.ko -> goi probe(). Driver lay dia chi thanh ghi tu "reg" va
+ * tan so tu "clock-frequency".
+ *
+ * Build: dtc -@ -I dts -O dtb -o soft-rtc.dtbo soft-rtc-overlay.dts
+ * Nap  : sudo dtoverlay -d . soft-rtc          (luc dang chay)
+ *   hoac copy vao /boot/firmware/overlays/ + dong "dtoverlay=soft-rtc"
+ *        trong /boot/firmware/config.txt roi reboot (luc boot)
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		/* Gan cac node ben trong __overlay__ vao node /soc cua cay goc */
+		target-path = "/soc";
+
+		__overlay__ {
+			/* Trung voi /soc cua BCM2835 (1 cell dia chi, 1 cell kich thuoc),
+			 * khai bao lai de dtc hieu dung dinh dang "reg" ben duoi */
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			soft_rtc: rtc@7e003000 {
+				/* Chuoi nay phai GIONG HET of_match_table trong driver */
+				compatible = "demo,soft-rtc";
+				/* System Timer: dia chi bus 0x7e003000, dai 0x20 byte.
+				 * Kernel dich qua "ranges" cua /soc -> vat ly 0x20003000 */
+				reg = <0x7e003000 0x20>;
+				/* Bo dem cua System Timer chay 1 MHz */
+				clock-frequency = <1000000>;
+				status = "okay";
+			};
+		};
+	};
+};
+
+Makefile (các dòng lệnh dưới target phải bắt đầu bằng phím TAB)
+
+makefile
+# Makefile - build soft_rtc (dung chung cho Ubuntu VM va Raspberry Pi)
+#
+# File nay duoc make doc HAI lan:
+#   Lan 1: ban go "make" -> KERNELRELEASE rong -> chay nhanh "else".
+#   Lan 2: Kbuild cua kernel doc lai file nay (KERNELRELEASE da co gia tri)
+#          -> chi can biet obj-m: can build module nao.
+
+ifneq ($(KERNELRELEASE),)
+# ---------- Phan Kbuild doc ----------
+# obj-m: build thanh module nap duoc (.ko). obj-y se la build dinh vao kernel.
+obj-m := soft_rtc.o
+# Chi can tren may ao x86: tao platform_device thay cho Device Tree
+obj-m += soft_rtc_dev.o
+
+else
+# ---------- Phan ban goi 'make' ----------
+# Cay build cua kernel DANG CHAY (goi linux-headers cung cap)
+KDIR ?= /lib/modules/$(shell uname -r)/build
+# Thu muc chua source module nay
+PWD := $(CURDIR)
+
+all: modules dtbo rtc_test
+
+# -C $(KDIR): vao cay kernel de dung Makefile/.config/header cua kernel do
+# M=$(PWD)  : bao Kbuild build module "ngoai cay" nam o thu muc nay
+modules:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+# Bien dich Device Tree overlay: .dts (van ban) -> .dtbo (nhi phan)
+dtbo: soft-rtc.dtbo
+soft-rtc.dtbo: soft-rtc-overlay.dts
+	dtc -@ -I dts -O dtb -o $@ $
+
+# Chuong trinh test o user-space (gcc thuong, khong lien quan Kbuild)
+rtc_test: rtc_test.c
+	$(CC) -Wall -O2 -o $@ $
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f soft-rtc.dtbo rtc_test
+
+.PHONY: all modules dtbo clean
+endif
+
+rtc_test.c
+
+c
+// rtc_test.c - Kiem thu driver RTC qua giao dien chuan /dev/rtcN (ioctl)
+// Build: make   (hoac: gcc -Wall -O2 -o rtc_test rtc_test.c)
+// Chay : sudo ./rtc_test /dev/rtc1   (VM)    |    sudo ./rtc_test /dev/rtc0   (Pi)
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/ioctl.h>
+#include <linux/rtc.h>
+
+static int n_pass, n_fail;
+
+static void check(int ok, const char *what)
+{
+	printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
+	if (ok)
+		n_pass++;
+	else
+		n_fail++;
+}
+
+/* struct rtc_time -> giay tu 1970. RTC trong Linux luon giu gio UTC */
+static time_t rtc_to_epoch(const struct rtc_time *r)
+{
+	struct tm t = {
+		.tm_sec = r->tm_sec, .tm_min = r->tm_min, .tm_hour = r->tm_hour,
+		.tm_mday = r->tm_mday, .tm_mon = r->tm_mon, .tm_year = r->tm_year,
+	};
+	return timegm(&t);
+}
+
+static void print_rtc(const char *label, const struct rtc_time *r)
+{
+	printf("       %s %04d-%02d-%02d %02d:%02d:%02d UTC\n", label,
+	       r->tm_year + 1900, r->tm_mon + 1, r->tm_mday,
+	       r->tm_hour, r->tm_min, r->tm_sec);
+}
+
+int main(int argc, char **argv)
+{
+	const char *path = argc > 1 ? argv[1] : "/dev/rtc0";
+	struct rtc_time a, b, t;
+	struct tm *g;
+	time_t now;
+	long d;
+	int fd, rc;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		/* ENOENT: chua probe | EBUSY: tien trinh khac dang mo | EACCES: thieu sudo */
+		perror(path);
+		return 2;
+	}
+
+	/* TC1: doc gio -> RTC core goi read_time() cua driver */
+	rc = ioctl(fd, RTC_RD_TIME, &a);
+	check(rc == 0, "TC1 RTC_RD_TIME doc duoc gio");
+	if (rc == 0)
+		print_rtc("RTC     =", &a);
+
+	/* TC2: sau 3 s gio phai tang ~3 s -> nguon dem va tan so (clock-frequency) dung */
+	sleep(3);
+	rc = ioctl(fd, RTC_RD_TIME, &b);
+	d = (long)(rtc_to_epoch(&b) - rtc_to_epoch(&a));
+	printf("       sau sleep(3): tang %ld s\n", d);
+	check(rc == 0 && d >= 2 && d <= 4, "TC2 dong ho chay dung toc do");
+
+	/* TC3: dat 2030-01-01 00:00:00 roi doc lai -> set_time() + read_time() */
+	memset(&t, 0, sizeof(t));
+	t.tm_year = 2030 - 1900;
+	t.tm_mon = 0;
+	t.tm_mday = 1;
+	rc = ioctl(fd, RTC_SET_TIME, &t);
+	check(rc == 0, "TC3a RTC_SET_TIME 2030-01-01 00:00:00");
+	rc = ioctl(fd, RTC_RD_TIME, &b);
+	if (rc == 0)
+		print_rtc("doc lai =", &b);
+	check(rc == 0 && b.tm_year == 130 && b.tm_mon == 0 && b.tm_mday == 1 &&
+	      b.tm_hour == 0 && b.tm_min == 0 && b.tm_sec <= 1,
+	      "TC3b doc lai dung gio vua dat");
+
+	/* TC4: kiem thu bien - nam 2150 nam ngoai range 2000..2099 -> phai bi tu choi */
+	t.tm_year = 2150 - 1900;
+	errno = 0;
+	rc = ioctl(fd, RTC_SET_TIME, &t);
+	check(rc < 0 && errno == ERANGE, "TC4 tu choi nam 2150 (ERANGE)");
+
+	/* TC5: khoi phuc RTC = gio he thong hien tai (UTC), giong "hwclock -w" */
+	now = time(NULL);
+	g = gmtime(&now);
+	memset(&t, 0, sizeof(t));
+	t.tm_sec = g->tm_sec;
+	t.tm_min = g->tm_min;
+	t.tm_hour = g->tm_hour;
+	t.tm_mday = g->tm_mday;
+	t.tm_mon = g->tm_mon;
+	t.tm_year = g->tm_year;
+	check(ioctl(fd, RTC_SET_TIME, &t) == 0, "TC5 khoi phuc RTC = gio he thong");
+
+	close(fd);
+	printf("\n==> %d PASS, %d FAIL\n", n_pass, n_fail);
+	return n_fail ? 1 : 0;
+}
+
+run_test.sh (sau khi tạo file: chmod +x run_test.sh)
+
+bash
+#!/bin/bash
+# run_test.sh - runtest tu dong cho soft_rtc
+# Chay trong thu muc da "make":   sudo ./run_test.sh
+#   Raspberry Pi: script tu nap overlay (dtoverlay -d . soft-rtc) neu chua co
+#   May ao x86  : khong co Device Tree -> script tu nap soft_rtc_dev.ko
+
+DRV=soft-rtc
+PASS=0
+FAIL=0
+ok()  { echo "[PASS] $*"; PASS=$((PASS + 1)); }
+bad() { echo "[FAIL] $*"; FAIL=$((FAIL + 1)); }
+
+[ "$(id -u)" -eq 0 ] || { echo "Hay chay voi sudo"; exit 2; }
+cd "$(dirname "$0")" || exit 2
+
+# Dang chay tren Raspberry Pi (co Device Tree cua Pi) hay may ao x86?
+IS_PI=0
+grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null && IS_PI=1
+
+# 1. Nap driver (neu chua nap)
+if ! lsmod | grep -q '^soft_rtc '; then
+    insmod ./soft_rtc.ko || { bad "insmod soft_rtc.ko (xem: sudo dmesg | tail)"; exit 1; }
+fi
+ok "driver soft_rtc da nap"
+
+# 2. Phai co device khop: Pi -> node Device Tree | VM -> soft_rtc_dev.ko
+if [ "$IS_PI" = 1 ]; then
+    if [ ! -d /proc/device-tree/soc/rtc@7e003000 ] && [ -f soft-rtc.dtbo ]; then
+        echo "       chua co node DT -> nap overlay: dtoverlay -d . soft-rtc"
+        dtoverlay -d . soft-rtc
+    fi
+    if [ -d /proc/device-tree/soc/rtc@7e003000 ]; then
+        ok "Device Tree co node /soc/rtc@7e003000"
+    else
+        bad "khong co node DT (xem: dtoverlay -l, file soft-rtc.dtbo)"; exit 1
+    fi
+else
+    if ! lsmod | grep -q '^soft_rtc_dev '; then
+        insmod ./soft_rtc_dev.ko || { bad "insmod soft_rtc_dev.ko"; exit 1; }
+    fi
+    ok "x86 khong co Device Tree -> tao device bang soft_rtc_dev.ko"
+fi
+sleep 1
+
+# 3. Tim /dev/rtcN cua driver minh (tranh test nham rtc0 cua VirtualBox)
+RTC=""
+for d in /sys/class/rtc/rtc*; do
+    grep -q "^$DRV" "$d/name" 2>/dev/null && RTC=$(basename "$d")
+done
+if [ -z "$RTC" ]; then
+    bad "khong thay rtc nao cua $DRV -> probe chua chay (xem dmesg)"; exit 1
+fi
+DEV=$(basename "$(readlink -f "/sys/class/rtc/$RTC/device")")
+ok "probe() OK: /dev/$RTC <- $(cat "/sys/class/rtc/$RTC/name")"
+
+# 3b. Tren Pi: driver phai chay HW mode (doc thanh ghi that cua SoC)
+if [ "$IS_PI" = 1 ]; then
+    MODE=$(dmesg | grep "$DEV: " | grep -oE '(HW|SW) mode' | tail -n 1)
+    if [ "$MODE" = "HW mode" ]; then
+        ok "HW mode: driver doc bo dem System Timer qua MMIO"
+    else
+        bad "lan probe gan nhat khong phai HW mode ('$MODE') -> kiem tra 'reg' trong DT"
+    fi
+fi
+
+# 4. Doc qua sysfs: sau 5 s gio phai tang ~5 s
+T1=$(cat "/sys/class/rtc/$RTC/since_epoch"); sleep 5
+T2=$(cat "/sys/class/rtc/$RTC/since_epoch"); D=$((T2 - T1))
+if [ "$D" -ge 4 ] && [ "$D" -le 6 ]; then ok "sysfs since_epoch tang $D s sau 5 s"
+else bad "sysfs since_epoch tang $D s (mong doi ~5)"; fi
+
+# 5. Test chuc nang qua ioctl (doc / dat / kiem thu bien)
+if ./rtc_test "/dev/$RTC"; then ok "rtc_test: moi test ioctl deu dat"
+else bad "rtc_test co test FAIL (xem o tren)"; fi
+
+# 6. unbind -> remove() ; bind -> probe() chay lai
+echo "$DEV" > "/sys/bus/platform/drivers/$DRV/unbind"; sleep 1
+if [ ! -e "/sys/bus/platform/drivers/$DRV/$DEV" ]; then ok "unbind: remove() chay, /dev/$RTC bi go"
+else bad "unbind that bai"; fi
+echo "$DEV" > "/sys/bus/platform/drivers/$DRV/bind"; sleep 1
+if [ -e "/sys/bus/platform/drivers/$DRV/$DEV" ]; then ok "bind: probe() chay lai"
+else bad "bind that bai"; fi
+
+echo
+echo "===== KET QUA: $PASS PASS, $FAIL FAIL ====="
+echo "--- dmesg lien quan ---"
+dmesg | grep -E "soft_rtc|$DEV" | tail -n 15
+echo "--- go bo sau khi test xong ---"
+if [ "$IS_PI" = 1 ]; then
+    echo "sudo dtoverlay -r soft-rtc && sudo rmmod soft_rtc"
+else
+    echo "sudo rmmod soft_rtc_dev soft_rtc"
+fi
+[ "$FAIL" -eq 0 ]
+2. Ý nghĩa từng khối trong Makefile
+Dòng / khối	Ý nghĩa	Thiếu hoặc sai thì sao
+ifneq ($(KERNELRELEASE),) … else … endif	Makefile được đọc 2 lần. Lần 1 do bạn gõ make (biến rỗng → nhánh else). Lần 2 do Kbuild của kernel đọc lại (biến có giá trị → chỉ cần obj-m).	Module đơn giản vẫn build được, nhưng Kbuild đọc luôn biến/target của bạn, dễ xung đột khi Makefile lớn dần. Đây là mẫu chuẩn trong tài liệu kernel.
+obj-m := soft_rtc.o	Build soft_rtc.c thành module nạp được soft_rtc.ko (m = module; obj-y = build dính vào kernel, chỉ dùng khi build cả kernel).	Không sinh ra .ko nào.
+obj-m += soft_rtc_dev.o	Module phụ tạo device cho VM.	VM không có device, nên driver nạp nhưng không bao giờ probe.
+KDIR ?= /lib/modules/$(shell uname -r)/build	Cây build của kernel đang chạy, do gói linux-headers cung cấp. ?= cho phép ghi đè: make KDIR=....	Chưa cài header: …/build: No such file or directory. Stop. Header khác kernel đang chạy: build được nhưng insmod báo Invalid module format.
+PWD := $(CURDIR)	Thư mục chứa source module.	Sai thì Kbuild không tìm thấy source.
+all: modules dtbo rtc_test	Việc mặc định khi gõ make.	Gõ make chỉ chạy target đầu tiên make gặp.
+$(MAKE) -C $(KDIR) M=$(PWD) modules	-C: nhảy vào cây kernel để dùng Makefile, .config, header, cờ biên dịch của đúng kernel đó. M=: module "ngoài cây" nằm ở thư mục này. modules: build module.	Thiếu -C: không có Kbuild, gcc không biết include/cờ của kernel. Thiếu M=: make đi build toàn bộ module của kernel (rất lâu, thường lỗi).
+Dòng lệnh thụt bằng TAB	Quy tắc bắt buộc của make.	Dùng dấu cách: *** missing separator. Stop.
+dtc -@ -I dts -O dtb -o $@ $<	-I dts: vào dạng chữ. -O dtb: ra nhị phân. $@ = soft-rtc.dtbo, $< = file nguồn. -@ sinh bảng __symbols__ để overlay khác tham chiếu nhãn soft_rtc.	Không có .dtbo thì Pi không có node, không probe. Thiếu -@: overlay này vẫn chạy (dùng target-path). Thiếu gói device-tree-compiler: dtc: not found.
+$(CC) -Wall -O2 -o $@ $<	Build chương trình test user-space bằng gcc thường, không qua Kbuild.	Không có ./rtc_test.
+clean:	Gọi clean của Kbuild xóa .o .ko .mod.c Module.symvers modules.order, rồi xóa .dtbo, rtc_test.	Chỉ để rác lại. Nên make clean trước khi build lại trên máy khác.
+.PHONY:	Báo đây là tên việc, không phải tên file.	Nếu thư mục lỡ có file tên clean, make tưởng đã xong và không chạy.
+
+Một số điểm liên quan khác:
+
+Phần "build" trong source: thiếu MODULE_LICENSE("GPL") thì modpost báo missing MODULE_LICENSE() và dừng. Ghi license không phải GPL thì không được dùng hàm GPL-only như __platform_driver_register, dẫn đến lỗi modpost.
+Alias tự nạp: MODULE_DEVICE_TABLE(of, …) sinh alias of:N*T*Cdemo,soft-rtc (xem bằng modinfo soft_rtc.ko) để udev tự nạp driver khi node DT xuất hiện.
+Không cần sudo make. Chỉ insmod/rmmod cần sudo.
+Warning vô hại trên Ubuntu: the compiler differs from the one used to build the kernel (chỉ khác tên gọi gcc-13), pahole version differs, Skipping BTF generation.
+3. Device Tree trong driver này
+
+Device Tree là bản mô tả phần cứng dạng cây mà bootloader/firmware đưa cho kernel. Nó dành cho thiết bị không tự khai báo được. Thiết bị USB/PCI tự báo ID, còn System Timer, PWM hay I2C controller nằm cứng ở một địa chỉ trong SoC, không có cơ chế tự phát hiện.
+
+Kernel đọc DT, tạo một platform_device cho mỗi node, rồi platform bus so compatible với of_match_table của các driver và gọi probe(). Overlay là "mảnh vá" thêm node vào DT gốc của Pi mà không phải sửa và build lại cả cây.
+
+Trong driver này, DT trả lời ba câu hỏi: dùng driver nào (compatible), phần cứng ở đâu (reg), cấu hình ra sao (clock-frequency).
+
+Dòng	Ý nghĩa	Thiếu / sai thì sao
+/dts-v1/; /plugin/;	Cú pháp DTS v1; /plugin/ đánh dấu đây là overlay.	Thiếu /plugin/: không nạp như overlay được.
+target-path = "/soc" + __overlay__	Ghép node vào /soc, bus chứa thiết bị trên chip.	Sai đường dẫn: dtoverlay báo lỗi apply, firmware bỏ qua overlay.
+#address-cells/#size-cells = <1>	Cách đọc reg: 1 ô địa chỉ + 1 ô kích thước, trùng với /soc.	Thiếu: dtc cảnh báo (vẫn chạy). Khai khác /soc: kernel từ chối overlay.
+soft_rtc: rtc@7e003000	Nhãn + tên node; kernel đặt tên device là 20003000.rtc.	—
+compatible = "demo,soft-rtc"	"Chìa khóa" chọn driver, phải giống hệt of_match_table.	Thiếu hoặc gõ sai 1 ký tự: insmod vẫn OK nhưng probe không bao giờ chạy, không có /dev/rtc0, và không có thông báo lỗi nào. Đây là lỗi "im lặng" hay gặp nhất.
+reg = <0x7e003000 0x20>	Địa chỉ bus + độ dài. Kernel dịch qua ranges của /soc (0x7e000000 → 0x20000000) thành vật lý 0x20003000. Driver lấy bằng platform_get_resource().	Thiếu: driver này cố ý lùi về SW mode (driver phần cứng bình thường sẽ probe lỗi). Sai địa chỉ: self-test báo counter … is not running - wrong 'reg'?, probe trả -ENODEV. Tệ hơn có thể chạm thanh ghi có tác dụng phụ, nên không bao giờ "đoán" địa chỉ.
+clock-frequency = <1000000>	Tần số bộ đếm, cùng giá trị với node System Timer gốc của Pi.	Thiếu: cảnh báo, mặc định 1 MHz. Sai: đồng hồ chạy nhanh/chậm, test tốc độ sẽ bắt được.
+status = "okay"	Bật node.	"disabled": kernel không tạo device, không probe.
+
+"Mất DT" ở các mức khác nhau:
+
+Không nạp overlay: driver "ngủ". lsmod thấy module, nhưng ls /sys/bus/platform/drivers/soft-rtc/ chỉ có bind module uevent unbind.
+Mất cả DT gốc: Pi không boot được, vì kernel ARM không có cách nào khác để biết SoC có gì.
+Trên VM: x86 dùng ACPI chứ không dùng DT. soft_rtc_dev.ko đóng vai "node DT"; không nạp nó thì triệu chứng y hệt.
+
+Lợi ích lớn nhất của DT so với hard-code: cùng System Timer ở địa chỉ bus 0x7e003000, nhưng địa chỉ vật lý là 0x20003000 trên Pi Zero/Pi 1, 0x3f003000 trên Pi 2/3 và 0xfe003000 trên Pi 4. ranges trong DT lo phần dịch, driver không phải sửa dòng nào. Đổi clock-frequency cũng chỉ cần build lại .dtbo, không đụng tới .ko.
+
+4. Platform driver khác character device thế nào
+
+Hai khái niệm này không loại trừ nhau. Chúng trả lời hai câu hỏi khác nhau.
+
+Tiêu chí	Character device	Platform driver
+Trả lời câu hỏi	User-space gọi driver thế nào (/dev/xxx, open/read/ioctl)	Kernel ghép driver với phần cứng thế nào (bus, match, probe)
+Cấu trúc trung tâm	file_operations, cdev, major/minor	platform_driver, of_device_id
+Lúc nào chạy	module_init chạy ngay khi insmod	probe() chỉ chạy khi có device khớp
+Số thiết bị	Thường 1, tự quản lý minor	0…N: mỗi node khớp là 1 lần probe, dữ liệu riêng priv
+Địa chỉ/IRQ	Hay hard-code	Lấy từ DT (reg, interrupts, clocks…)
+Giao diện user	Tự định nghĩa; công cụ chuẩn không hiểu	Giao cho subsystem: RTC core tạo /dev/rtcN + ioctl chuẩn
+Dọn dẹp	Tự gỡ ngược thứ tự trong module_exit	remove() + devm_* tự giải phóng
+Bind/unbind lúc chạy	Không có	Có (sysfs, dtoverlay -r)
+
+So sánh ở mức code (rút gọn, bỏ xử lý lỗi):
+
+c
+/* (A) Character device "thuan" kieu tutorial */
+static const struct file_operations fops = {
+	.owner = THIS_MODULE, .read = my_read, .unlocked_ioctl = my_ioctl,
+};
+static int __init my_init(void)			/* chay NGAY khi insmod */
+{
+	alloc_chrdev_region(&devno, 0, 1, "myrtc");
+	cdev_init(&my_cdev, &fops);
+	cdev_add(&my_cdev, devno, 1);
+	my_class = class_create("myrtc");		/* kernel >= 6.4 */
+	device_create(my_class, NULL, devno, NULL, "myrtc");	/* -> /dev/myrtc */
+	base = ioremap(0x20003000, 0x20);		/* hard-code: chi dung cho Pi Zero/Pi 1 */
+	return 0;
+}
+
+/* (B) Platform driver (soft_rtc.c) */
+module_platform_driver(soft_rtc_driver);	/* chi DANG KY, chua cham phan cung */
+static int soft_rtc_probe(struct platform_device *pdev)	/* chay khi co device khop */
+{
+	res  = platform_get_resource(pdev, IORESOURCE_MEM, 0);	/* dia chi tu DT */
+	base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	rtc  = devm_rtc_allocate_device(&pdev->dev);
+	rtc->ops = &soft_rtc_ops;			/* chi viet read_time/set_time */
+	return devm_rtc_register_device(rtc);		/* RTC core tao /dev/rtcN chuan */
+}
+
+Điểm mấu chốt: driver của bạn vẫn có character device /dev/rtc0, nhưng do RTC core tạo sẵn với ioctl chuẩn. Nhờ vậy hwclock, timedatectl và cả kernel (đặt giờ lúc boot) dùng được ngay.
+
+Nếu viết char device thuần /dev/myrtc, bạn phải tự định nghĩa ioctl và các công cụ chuẩn sẽ không dùng được. Thêm nữa, địa chỉ hard-code sẽ đọc nhầm khi chạy trên Pi 3.
+
+5. Runtest trên Ubuntu (Oracle VirtualBox)
+
+Bước 1 – Chuẩn bị (một lần)
+
+bash
+sudo apt update
+sudo apt install -y build-essential linux-headers-$(uname -r) device-tree-compiler
+ls -d /lib/modules/$(uname -r)/build       # phải tồn tại (đây là KDIR)
+mokutil --sb-state                          # nên là "SecureBoot disabled"
+command -v hwclock || sudo apt install -y util-linux-extra
+
+Bước 2 – Build
+
+bash
+cd ~/soft_rtc && chmod +x run_test.sh
+make                                        # ra soft_rtc.ko soft_rtc_dev.ko soft-rtc.dtbo rtc_test
+modinfo soft_rtc.ko                         # vermagic phải trùng uname -r
+
+Trên VM, soft-rtc.dtbo chỉ để kiểm tra cú pháp DT.
+
+Bước 3 – Theo dõi log: mở terminal thứ hai và chạy sudo dmesg -w.
+
+Bước 4 – Trạng thái ban đầu
+
+bash
+ls /dev/rtc*                  # /dev/rtc /dev/rtc0 — rtc0 là RTC CMOS giả lập của VirtualBox
+cat /sys/class/rtc/rtc0/name  # rtc_cmos ...
+
+Bước 5 – Nạp driver (nạp ≠ probe)
+
+bash
+sudo insmod soft_rtc.ko trace=1
+ls /sys/bus/platform/drivers/soft-rtc/   # bind module uevent unbind — chưa có device
+ls /dev/rtc*                             # vẫn chỉ rtc0: driver đã nạp nhưng CHƯA probe
+
+Bước 6 – Tạo device để probe chạy
+
+bash
+sudo insmod soft_rtc_dev.ko
+sudo dmesg | tail -n 6
+
+Bạn sẽ thấy dạng:
+
+soft-rtc soft-rtc: probe(): matched by name (no Device Tree)
+soft-rtc soft-rtc: SW mode: no 'reg' resource, time base = ktime
+soft-rtc soft-rtc: registered as rtc1
+soft-rtc soft-rtc: probe() done -> /dev/rtc1
+soft_rtc_dev: platform_device 'soft-rtc' registered
+
+Dòng probe xuất hiện trước dòng "registered" của soft_rtc_dev. Lý do: probe chạy đồng bộ ngay bên trong lúc đăng ký device.
+
+Lần insmod đầu tiên còn có thêm loading out-of-tree module taints kernel và module verification failed … tainting kernel. Hai dòng này là bình thường.
+
+Bước 7 – Đọc/ghi thủ công
+
+bash
+cat /sys/class/rtc/rtc1/name                            # soft-rtc soft-rtc
+cat /sys/class/rtc/rtc1/date /sys/class/rtc/rtc1/time   # UTC
+sudo hwclock -r -f /dev/rtc1                            # giờ địa phương (+07:00)
+sudo hwclock -f /dev/rtc1 --set --date "2030-01-01 07:00:00"
+cat /sys/class/rtc/rtc1/date /sys/class/rtc/rtc1/time   # 2030-01-01 00:00:0x (UTC)
+sudo hwclock -w -f /dev/rtc1                            # trả RTC về = giờ hệ thống
+sudo dmesg | grep -E 'read_time|set_time' | tail        # bằng chứng lệnh đi qua driver
+
+Lưu ý khi làm bước này:
+
+UTC và giờ địa phương: hwclock hiện giờ địa phương, còn sysfs/kernel luôn dùng UTC. Nếu VM để múi giờ Asia/Ho_Chi_Minh thì lệch 7 tiếng là đúng.
+Luôn có -f /dev/rtc1: thiếu nó là bạn đang chỉnh RTC CMOS của VM.
+"Waiting in loop…" là bình thường: hwclock --verbose có thể in Waiting in loop for time … to change, vì driver không có ngắt update/alarm.
+Không chạy hwclock -s khi RTC đang giữ giờ test 2030: giờ hệ thống sẽ nhảy sang 2030 và apt/HTTPS lỗi chứng chỉ.
+
+Bước 8 – Test tự động
+
+bash
+sudo ./rtc_test /dev/rtc1
+
+Kết quả mong đợi:
+
+[PASS] TC1 RTC_RD_TIME doc duoc gio
+       RTC     = 2026-09-24 05:30:12 UTC
+       sau sleep(3): tang 3 s
+[PASS] TC2 dong ho chay dung toc do
+[PASS] TC3a RTC_SET_TIME 2030-01-01 00:00:00
+       doc lai = 2030-01-01 00:00:00 UTC
+[PASS] TC3b doc lai dung gio vua dat
+[PASS] TC4 tu choi nam 2150 (ERANGE)
+[PASS] TC5 khoi phuc RTC = gio he thong
+
+==> 6 PASS, 0 FAIL
+
+Sau đó chạy sudo ./run_test.sh. Trên VM, script kết thúc bằng KET QUA: 7 PASS, 0 FAIL.
+
+Bước 9 – Vòng đời probe/remove
+
+bash
+echo soft-rtc | sudo tee /sys/bus/platform/drivers/soft-rtc/unbind   # remove() called, rtc1 mất
+echo soft-rtc | sudo tee /sys/bus/platform/drivers/soft-rtc/bind     # probe() chạy lại
+echo 0 | sudo tee /sys/module/soft_rtc/parameters/trace              # tắt trace lúc đang chạy
+sudo rmmod soft_rtc_dev      # gỡ device → remove()
+sudo rmmod soft_rtc
+
+Dùng | sudo tee vì sudo echo … > /sys/… sẽ báo Permission denied: dấu > chạy bằng quyền user thường.
+
+6. Runtest trên Pi Zero W
+
+Bước 0 – Môi trường. Pi Zero W là ARMv6 nên chỉ chạy Raspberry Pi OS 32-bit (nên dùng bản Lite). Vì chưa hàn chân, bạn truy cập bằng SSH qua Wi-Fi.
+
+VS Code Remote-SSH không hỗ trợ ARMv6. Cách làm: soạn trên VM rồi copy sang Pi bằng scp -r ~/soft_rtc <user>@<ip-pi>:~/. Tuyệt đối không dùng lại file .ko build trên VM.
+
+Bước 1 – Công cụ
+
+bash
+sudo apt update
+sudo apt install -y build-essential device-tree-compiler linux-headers-rpi-v6
+ls -d /lib/modules/$(uname -r)/build
+
+Nếu không có thư mục build: chạy sudo apt full-upgrade -y && sudo reboot rồi kiểm tra lại. Lý do: header được cài theo kernel mới nhất trong khi Pi đang chạy kernel cũ. Với Bullseye, gói header là raspberrypi-kernel-headers.
+
+Bước 2 – Baseline: chứng minh Pi không có RTC (chụp lại để đưa vào báo cáo)
+
+bash
+cat /proc/device-tree/model             # Raspberry Pi Zero W Rev 1.1
+ls /dev/rtc*                            # No such file or directory
+timedatectl | grep "RTC time"           # RTC time: n/a
+sudo hwclock -r                         # Cannot access the Hardware Clock via any known method.
+ls /proc/device-tree/soc | grep 7e003000   # chỉ có timer@7e003000
+
+Bước 3 – Build trên Pi
+
+bash
+cd ~/soft_rtc && make clean && make     # Pi Zero chậm, chờ 1–2 phút
+modinfo -F vermagic soft_rtc.ko         # khớp uname -r, có "ARMv6"
+
+Bước 4 – Nạp overlay lúc đang chạy
+
+bash
+sudo dtoverlay -d . soft-rtc
+dtoverlay -l                                   # 0:  soft-rtc
+ls /proc/device-tree/soc/rtc@7e003000/
+ls /sys/bus/platform/devices/ | grep 20003000  # 20003000.rtc
+
+Bước 5 – Nạp driver
+
+bash
+sudo insmod soft_rtc.ko trace=1
+sudo dmesg | tail -n 8
+
+Bạn sẽ thấy dạng:
+
+soft-rtc 20003000.rtc: probe(): matched by Device Tree (compatible)
+soft-rtc 20003000.rtc: HW mode: counter @ [mem 0x20003000-0x2000301f], 1000000 Hz
+soft-rtc 20003000.rtc: registered as rtc0
+soft-rtc 20003000.rtc: setting system clock to 2026-09-24T05:30:12 UTC (...)
+soft-rtc 20003000.rtc: probe() done -> /dev/rtc0
+
+Dòng "setting system clock" xuất hiện vì kernel Pi bật RTC_HCTOSYS cho rtc0: kernel lấy giờ hệ thống từ RTC ngay khi đăng ký, giống hệt lúc boot với RTC thật. Driver đã khởi tạo bằng giờ hệ thống nên giờ không bị nhảy.
+
+Bước 6 – Kiểm tra
+
+bash
+cat /sys/class/rtc/rtc0/name       # soft-rtc 20003000.rtc
+cat /sys/class/rtc/rtc0/hctosys    # 1
+timedatectl                        # RTC time không còn n/a
+sudo hwclock -r
+sudo ./rtc_test /dev/rtc0
+sudo ./run_test.sh                 # kết thúc bằng 8 PASS
+
+Khi giờ hệ thống đã đồng bộ NTP, kernel sẽ ghi giờ vào rtc0 khoảng 11 phút một lần. Vì vậy thỉnh thoảng bạn thấy dòng set_time <- … trong dmesg dù không gõ lệnh gì; đó không phải lỗi.
+
+Bước 7 – Gỡ
+
+bash
+sudo dtoverlay -r soft-rtc   # node mất → remove() called, /dev/rtc0 mất
+sudo rmmod soft_rtc
+
+Nạp overlay lúc boot (để demo):
+
+Copy overlay: sudo cp soft-rtc.dtbo /boot/firmware/overlays/ (Bullseye: /boot/overlays/).
+Sửa sudo nano /boot/firmware/config.txt, thêm dòng dtoverlay=soft-rtc dưới mục [all] cuối file, rồi reboot.
+Muốn udev tự nạp driver khi node xuất hiện: copy soft_rtc.ko vào /lib/modules/$(uname -r)/extra/ rồi chạy sudo depmod -a.
+Overlay nạp lúc boot không gỡ được bằng dtoverlay -r. Các test âm ở mục 10 nên dùng cách nạp lúc chạy.
+7. Các lệnh runtest: để làm gì, bỏ qua thì sao
+Lệnh	Để làm gì	Bỏ qua thì sao
+ls /dev/rtc*, timedatectl, hwclock -r trước khi nạp	Baseline trước/sau	Không có bằng chứng thay đổi; trên VM dễ test nhầm rtc0 của VirtualBox
+sudo dmesg -w / dmesg | tail	Xem probe, chế độ HW/SW, lỗi	Không biết probe có chạy hay lỗi ở đâu
+make, modinfo	Build, kiểm tra vermagic và alias	Invalid module format nếu build sai kernel
+insmod soft_rtc.ko [trace=1]	Đăng ký driver với platform bus	Device có sẵn cũng không ai nhận
+insmod soft_rtc_dev.ko (VM) / dtoverlay -d . soft-rtc (Pi)	Tạo device để bus ghép với driver	Driver nạp nhưng không probe, không /dev/rtcN, không báo lỗi
+ls /sys/bus/platform/drivers/soft-rtc/	Xem device nào đang gắn với driver	Không biết đã bind chưa
+cat /sys/class/rtc/rtcN/name	Xác định rtcN nào là của mình	VM: đọc nhầm rtc_cmos
+cat …/date …/time …/since_epoch	Đọc qua sysfs → read_time()	—
+hwclock -r / --set / -w	Đọc/ghi qua ioctl như công cụ thật	Không kiểm được chiều ghi set_time()
+./rtc_test	Test tự động có PASS/FAIL, gồm test biên ERANGE	Chỉ kiểm bằng mắt, thiếu test âm
+./run_test.sh	Gom mọi bước thành 1 lệnh lặp lại được	Dễ sót bước khi demo
+unbind / bind	Kiểm remove()/probe() không cần rmmod	Không chứng minh được vòng đời
+rmmod / dtoverlay -r	Gỡ sạch, kiểm không oops	Lần insmod sau báo File exists
+8. Runtest trên Ubuntu và trên Pi có giống nhau không?
+Tiêu chí	Ubuntu (VirtualBox)	Pi Zero W
+Kiến trúc / build	x86_64, build trên VM	ARMv6 32-bit, build trên Pi
+Header	linux-headers-$(uname -r)	linux-headers-rpi-v6
+Device xuất hiện nhờ	soft_rtc_dev.ko (khớp tên)	Node DT (khớp compatible)
+Nguồn thời gian	SW mode (ktime)	HW mode (System Timer, MMIO 0x20003000)
+Số RTC	rtc1 (rtc0 = CMOS giả lập)	rtc0
+Ảnh hưởng giờ hệ thống	Không	Có (hctosys lúc đăng ký, NTP ghi ~11 phút/lần)
+Lệnh test	hwclock -f /dev/rtc1, rtc_test /dev/rtc1	hwclock, timedatectl, rtc_test /dev/rtc0
+Chứng minh được	Logic driver, platform bus, RTC core, vòng đời	+ DT thật, thanh ghi SoC thật, kernel ARM thật
+Không chứng minh được	DT, phần cứng	Giữ giờ khi mất điện (không có pin/chip RTC)
+
+Kết luận: các lệnh kiểm thử gần như giống nhau, vì cả hai dùng chung giao diện chuẩn /dev/rtcN + sysfs. Đó chính là lợi ích của RTC subsystem. Chỗ khác là cách device xuất hiện, nguồn thời gian và ý nghĩa của kết quả.
+
+VM chứng minh phần mềm, Pi chứng minh DT + phần cứng; hai bên không thay thế nhau. Nên chạy VM trước (lỗi không làm treo Pi, sửa nhanh), rồi mới lên Pi.
+
+9. Pi chưa hàn chân test được gì? "Lấy giờ trên Pi rồi hiển thị ra màn hình" có tính là thành công không?
+
+Không, nếu "lấy thẳng trên Pi" nghĩa là gõ date, timedatectl hay hwclock khi chưa nạp driver. Có hai lý do:
+
+Pi Zero W không có chip RTC. Giờ bạn thấy là giờ hệ thống lấy từ NTP/fake-hwclock.
+Lệnh đó không đi qua driver của bạn. Baseline ở bước 2 (mục 6) cho thấy rõ RTC time: n/a.
+
+Có, khi đủ chuỗi bằng chứng sau:
+
+Node /proc/device-tree/soc/rtc@7e003000 tồn tại.
+dmesg có matched by Device Tree (compatible) và HW mode: counter @ [mem 0x20003000-…], 1000000 Hz.
+/sys/class/rtc/rtc0/name là soft-rtc 20003000.rtc, tức /dev/rtc0 là của driver bạn.
+Khi bật trace=1, mỗi lần đọc giờ (hwclock, sysfs) đều sinh dòng read_time ->, chứng tỏ lệnh đi qua code của bạn.
+Đặt 2030 rồi đọc lại đúng 2030; sleep 3 thì giờ tăng đúng 3 s.
+dtoverlay -r làm xuất hiện remove() called và /dev/rtc0 biến mất.
+Test âm clock-frequency = <500000> làm đồng hồ chạy nhanh gấp đôi. Điều này chứng minh thời gian thật sự đến từ bộ đếm phần cứng và tham số DT.
+
+Viết trong báo cáo cho trung thực: "Runtest thành công platform driver RTC trên phần cứng thật Raspberry Pi Zero W: driver được bind qua Device Tree, đọc bộ đếm System Timer 64-bit của SoC BCM2835 qua MMIO và cung cấp giao diện RTC chuẩn /dev/rtc0." Ghi rõ giới hạn: không có pin nên không giữ giờ khi mất điện, và không có alarm. Đừng viết là "kiểm thử chip RTC".
+
+Không cần hàn chân, bạn vẫn test được những gì nằm trong SoC/board:
+
+System Timer: chính là driver này.
+Các platform driver có sẵn để đối chiếu: đèn LED ACT (GPIO47, driver leds-gpio, compatible gpio-leds), watchdog bcm2835-wdt, bộ sinh số ngẫu nhiên bcm2835-rng (/dev/hwrng), cảm biến nhiệt bcm2835_thermal. Đây đúng là nhóm trong hình của bạn.
+Cẩn thận với watchdog: mở /dev/watchdog0 rồi bỏ đó là Pi tự reboot.
+bash
+ls /sys/bus/platform/drivers/
+cat /sys/class/thermal/thermal_zone0/temp
+echo none   | sudo tee /sys/class/leds/ACT/trigger
+echo 1      | sudo tee /sys/class/leds/ACT/brightness   # LED sáng (thấy tận mắt)
+echo actpwr | sudo tee /sys/class/leds/ACT/trigger      # trả lại mặc định
+
+Cần chân GPIO (hàn, dùng header "hammer" không cần hàn, hoặc mua Pi Zero WH):
+
+RTC thật: module DS3231/DS1307 qua I2C, với dtoverlay=i2c-rtc,ds3231 và driver rtc-ds1307. Đây là I2C driver chứ không phải platform driver, và mới là test "rút điện vẫn giữ giờ".
+Dự án nhóm: quạt PWM (GPIO18) và LM75 (I2C) cũng cần chân, nên hàn sớm.
+Tái sử dụng khung driver: khung platform driver này dùng lại được cho driver quạt. Đổi reg thành thuộc tính pwms = <&pwm …> và gọi devm_pwm_get() trong probe.
+10. Kế hoạch kiểm thử
+ID	Nội dung	Cách làm	Kỳ vọng	VM	Pi
+T01	Build	make	Có .ko, .dtbo, rtc_test, không lỗi	✓	✓
+T02	Nạp/gỡ module	insmod/rmmod	Không oops	✓	✓
+T03	Match & probe	dmesg	VM: "by name"; Pi: "by Device Tree"	✓	✓
+T04	Nhận diện RTC	cat …/name	soft-rtc …	✓	✓
+T05	Đọc giờ	sysfs, hwclock -r, TC1	Giờ hợp lệ	✓	✓
+T06	Tốc độ	TC2, sysfs +5 s	Tăng đúng số giây	✓	✓
+T07	Đặt giờ	TC3, hwclock --set	Đọc lại đúng	✓	✓
+T08	Biên	TC4 (năm 2150)	Bị từ chối, ERANGE	✓	✓
+T09	Vòng đời	unbind/bind, dtoverlay -r	remove()/probe() trong dmesg	✓	✓
+T10	HW mode	dmesg	HW mode … 0x20003000	–	✓
+T11	hctosys	cat …/hctosys	1	–	✓
+T12	Âm: sai compatible	Sửa thành demo,soft-rtx	Có device nhưng không probe, dmesg im lặng	–	✓
+T13	Âm: bỏ reg	Xóa dòng reg	dmesg "SW mode", run_test FAIL bước HW	–	✓
+T14	Âm: sai tần số	clock-frequency = <500000>	Đồng hồ nhanh ×2, TC2 FAIL	–	✓
+T15	Âm: disabled	status = "disabled"	Không có 20003000.rtc	–	✓
+
+Cách làm test âm: sửa DTS, chạy make dtbo, rồi sudo dtoverlay -r soft-rtc && sudo dtoverlay -d . soft-rtc. Driver đang nạp sẵn sẽ tự probe lại với DT mới. Nhớ trả DTS về bản gốc sau khi test.
+
+11. Lỗi hay gặp
+Triệu chứng	Nguyên nhân	Cách sửa
+Key was rejected by service	VM bật Secure Boot	Tắt VM → Settings → System → bỏ tick Enable Secure Boot (hoặc ký module bằng MOK)
+Invalid module format	.ko build cho kernel khác	make clean && make trên chính máy đó
+…/build: No such file or directory	Chưa cài hoặc cài sai header	Cài header; Pi thì full-upgrade + reboot
+missing separator	Dòng lệnh thụt bằng dấu cách	Thay bằng TAB
+/bin/bash^M: bad interpreter	File CRLF từ Windows	sed -i 's/\r$//' Makefile run_test.sh *.c *.dts, hoặc chọn LF ở góc dưới VS Code
+insmod OK nhưng không có /dev/rtcN	Không có device khớp	VM: nạp soft_rtc_dev.ko; Pi: nạp overlay, soát compatible/status
+File exists	Module đã nạp	rmmod trước
+Module soft_rtc is in use / Device or resource busy	Có tiến trình đang mở /dev/rtcN (chỉ cho 1 tiến trình mở)	Đợi hwclock/rtc_test chạy xong
+dmesg: … Operation not permitted	dmesg bị giới hạn quyền	sudo dmesg
+counter … is not running - wrong 'reg'?	reg sai	Sửa DTS

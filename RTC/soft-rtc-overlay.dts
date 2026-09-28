@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * soft-rtc-overlay.dts - Device Tree overlay cho Raspberry Pi Zero W (BCM2835)
+ *
+ * Them node "rtc@7e003000" vao bus /soc. Kernel tao platform_device
+ * "20003000.rtc", platform bus so "compatible" voi of_match_table cua
+ * soft_rtc.ko -> goi probe(). Driver lay dia chi thanh ghi tu "reg" va
+ * tan so tu "clock-frequency".
+ *
+ * Build: dtc -@ -I dts -O dtb -o soft-rtc.dtbo soft-rtc-overlay.dts
+ * Nap  : sudo dtoverlay -d . soft-rtc          (luc dang chay)
+ *   hoac copy vao /boot/firmware/overlays/ + dong "dtoverlay=soft-rtc"
+ *        trong /boot/firmware/config.txt roi reboot (luc boot)
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		/* Gan cac node ben trong __overlay__ vao node /soc cua cay goc */
+		target-path = "/soc";
+
+		__overlay__ {
+			/* Trung voi /soc cua BCM2835 (1 cell dia chi, 1 cell kich thuoc),
+			 * khai bao lai de dtc hieu dung dinh dang "reg" ben duoi */
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			soft_rtc: rtc@7e003000 {
+				/* Chuoi nay phai GIONG HET of_match_table trong driver */
+				compatible = "demo,soft-rtc";
+				/* System Timer: dia chi bus 0x7e003000, dai 0x20 byte.
+				 * Kernel dich qua "ranges" cua /soc -> vat ly 0x20003000 */
+				reg = <0x7e003000 0x20>;
+				/* Bo dem cua System Timer chay 1 MHz */
+				clock-frequency = <1000000>;
+				status = "okay";
+			};
+		};
+	};
+};
